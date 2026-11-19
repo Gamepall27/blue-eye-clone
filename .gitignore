@@ -1,0 +1,7 @@
+# Local SDR and simulation output; never commit captured activity logs.
+/activity_log.csv
+/adaptive_calibration_log*.csv
+/simulation_activity_log.csv
+/simulation_adaptation_log*.csv
+__pycache__/
+*.py[cod]
