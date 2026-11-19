@@ -12,7 +12,7 @@ python3 blueeye.py
 
 Standardmäßig erfasst das Programm ausschließlich **380–385 MHz**. `rtl_power` kann diesen 5-MHz-Bereich intern über mehrere Empfangs-Hops abtasten; das ist keine simultane oder garantiert lückenlose Erfassung.
 
-Das Programm misst ausschließlich Empfangspegel. Es dekodiert keine Kommunikation und identifiziert oder ortet keine Quelle. Ein Alarm zeigt nur auffällige Aktivität im gerade erfassten Bereich an. `Ctrl-C` beendet den Scan sauber. Messwerte stehen in `activity_log.csv`; der Frequenzbereich und der jeweilige `rtl_power`-Hop sind im `state`-Feld mitgeführt. Laufende Kalibrierungsanpassungen werden zusätzlich in `adaptive_calibration_log.csv` protokolliert.
+Das Programm misst ausschließlich Empfangspegel. Es dekodiert keine Kommunikation und identifiziert oder ortet keine Quelle. Ein Alarm zeigt nur auffällige Aktivität im gerade erfassten Bereich an. `Ctrl-C` oder `SIGTERM` beendet den Scan sauber, stoppt den gestarteten `rtl_power`-Prozess und räumt dessen temporäre CSV auf. Messwerte stehen in `activity_log.csv`; der Frequenzbereich und der jeweilige `rtl_power`-Hop sind im `state`-Feld mitgeführt. Laufende Kalibrierungsanpassungen werden zusätzlich in `adaptive_calibration_log.csv` protokolliert.
 
 Ein anderer einzelner Frequenzbereich kann angegeben werden:
 

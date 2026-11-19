@@ -2,6 +2,7 @@ import csv
 import os
 import pty
 import random
+import signal
 import select
 import subprocess
 import sys
@@ -232,7 +233,8 @@ class BlueEyeTests(unittest.TestCase):
     def test_long_run_keeps_model_windows_bounded_and_logs_every_measurement(self):
         monitor, key = self.calibrated_monitor()
         rng = random.Random(917)
-        for _ in range(300):
+        sample_count = 2048
+        for _ in range(sample_count):
             values = [-95.0 + rng.gauss(0, 0.8) for _ in range(500)]
             metrics = monitor.compute_runtime_metrics(monitor.parse_metrics_from_power_values(values), key)
             _, score, state = monitor.step(metrics)
@@ -244,7 +246,7 @@ class BlueEyeTests(unittest.TestCase):
         self.assertLessEqual(len(model["recent_scores"]), 8)
         for path in (monitor.cfg.log_file, monitor.cfg.adaptation_log_file):
             with open(path, newline="") as f:
-                self.assertEqual(sum(1 for _ in csv.DictReader(f)), 300)
+                self.assertEqual(sum(1 for _ in csv.DictReader(f)), sample_count)
 
     def test_old_adaptation_schema_is_preserved_and_new_log_is_versioned(self):
         old_path = self.temp_path / "adaptive.csv"
@@ -357,6 +359,44 @@ class BlueEyeTests(unittest.TestCase):
         child_pid = int(pid_marker.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
+
+    def test_sigterm_cleans_up_fake_rtl_power_child_and_temp_csv(self):
+        pid_marker = self.temp_path / "sigterm-child-pid.txt"
+        tool = self._fake_rtl_power(
+            "import os,pathlib,time\n"
+            "pathlib.Path(os.environ['BLUEEYE_TEST_PID_FILE']).write_text(str(os.getpid()))\n"
+            "time.sleep(60)\n")
+        child_env = os.environ.copy()
+        child_env["BLUEEYE_TEST_PID_FILE"] = str(pid_marker)
+        child_env["TMPDIR"] = str(self.temp_path)
+        command = [sys.executable, str(ROOT / "blueeye.py"), "--rtl-power", tool,
+                   "--calibration", "1", "--log", str(self.temp_path / "sigterm.csv"),
+                   "--adapt-log", str(self.temp_path / "sigterm-adapt.csv")]
+        proc = subprocess.Popen(command, cwd=str(ROOT), env=child_env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while not pid_marker.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(pid_marker.exists(), "fake rtl_power did not start")
+            child_pid = int(pid_marker.read_text())
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=5), 0)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            self.assertEqual(list(self.temp_path.glob("rtl_power_*.csv")), [])
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    os.kill(child_pid, signal.SIGKILL)
 
     def test_live_file_reader_ignores_duplicate_and_late_rtl_power_rows(self):
         row = lambda second: (

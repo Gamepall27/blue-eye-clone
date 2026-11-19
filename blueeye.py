@@ -644,6 +644,11 @@ def run_band_scan(cfg, monitor, rtl_power, env):
             pass
 
 
+def _sigterm_as_keyboard_interrupt(_signum, _frame):
+    """Route SIGTERM through the normal cleanup path in the main thread."""
+    raise KeyboardInterrupt
+
+
 def main():
     parser = argparse.ArgumentParser(description="RTL-SDR Empfangspegel-Scan auf einem Frequenzbereich; keine Quellenidentifikation.")
     parser.add_argument("--start", type=float, help="Startfrequenz in MHz (nur zusammen mit --end; Standard: 380)")
@@ -675,10 +680,15 @@ def main():
         for low, high in bands
     ]
     if args.simulate:
+        previous_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_as_keyboard_interrupt)
         try:
             run_simulation(band_configs)
+        except KeyboardInterrupt:
+            print("\nSimulation beendet.", flush=True)
         except (RuntimeError, OSError) as exc:
             parser.error(str(exc))
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
         return
     rtl_power = args.rtl_power if os.path.isfile(args.rtl_power) else shutil.which(args.rtl_power)
     if not rtl_power:
@@ -693,6 +703,7 @@ def main():
         parser.error(f"Protokolldatei kann nicht angelegt werden: {exc}")
     print(f"Starte Empfang auf {band_configs[0].band_label} MHz · anfängliche Kalibrierung: {calibration_seconds} s · Mess-CSV: {os.path.abspath(log_file)} · Anpassungs-CSV: {os.path.abspath(band_configs[0].adaptation_log_file)}")
     print("Leistungsspitzen zeigen Aktivität, keine verlässliche Geräte-, Organisations- oder Quellenidentität. Abbruch mit Ctrl-C.\n", flush=True)
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_as_keyboard_interrupt)
     try:
         while True:
             for cfg in band_configs:
@@ -703,6 +714,8 @@ def main():
         print("\nScan beendet.", flush=True)
     except (RuntimeError, OSError) as exc:
         print(f"\nFEHLER: {exc}", file=sys.stderr, flush=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 if __name__ == "__main__":
