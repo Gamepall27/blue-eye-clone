@@ -282,6 +282,39 @@ class BlueEyeTests(unittest.TestCase):
                 blueeye.main()
             self.assertEqual(error.exception.code, 2)
 
+    def test_sigterm_restores_simulation_terminal_mode(self):
+        master, slave = pty.openpty()
+        original = termios.tcgetattr(slave)
+        command = [sys.executable, str(ROOT / "blueeye.py"), "--simulate", "--calibration", "1",
+                   "--log", str(self.temp_path / "sigterm-sim.csv"),
+                   "--adapt-log", str(self.temp_path / "sigterm-sim-adapt.csv")]
+        proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, cwd=str(ROOT))
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 5
+            while b"SIMULATION" not in output and time.monotonic() < deadline:
+                readable, _, _ = select.select([master], [], [], .1)
+                if readable:
+                    try:
+                        output.extend(os.read(master, 8192))
+                    except OSError:
+                        break
+            self.assertIn(b"SIMULATION", output)
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=5), 0)
+            restored = termios.tcgetattr(slave)
+            self.assertEqual(restored[:3], original[:3])
+            pending_reprint_flag = getattr(termios, "PENDIN", 0)
+            self.assertEqual(restored[3] & ~pending_reprint_flag,
+                             original[3] & ~pending_reprint_flag)
+            self.assertEqual(restored[6], original[6])
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+            os.close(master)
+            os.close(slave)
+
     def test_simulation_short_key_does_not_alarm_but_long_key_does(self):
         master, slave = pty.openpty()
         cfg = self.config(log_file=str(self.temp_path / "pulse-sim.csv"),
