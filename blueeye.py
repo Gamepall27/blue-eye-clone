@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import csv
 import argparse
+import datetime
 import math
 import os
 import random
@@ -68,9 +69,10 @@ class AdaptiveBandActivityMonitor:
         self.alert_off_score = 28.0
         self.min_active_bins = 2
 
-        self.calibration_started_at = time.time()
+        self.calibration_started_at = time.monotonic()
         self.calibration_samples = {}
         self.hop_models = {}
+        self.last_record_timestamp = {}
 
         self._ensure_log_header()
 
@@ -189,7 +191,30 @@ class AdaptiveBandActivityMonitor:
         })
 
     def calibration_finished(self):
-        return (time.time() - self.calibration_started_at) >= self.cfg.calibration_seconds
+        return (time.monotonic() - self.calibration_started_at) >= self.cfg.calibration_seconds
+
+    def accept_record_timestamp(self, hop_key, observed_at):
+        """Reject duplicate/late rtl_power rows and reset temporal state after a long gap."""
+        if observed_at is None:
+            return True
+        previous = self.last_record_timestamp.get(hop_key)
+        if previous is not None:
+            elapsed = (observed_at - previous).total_seconds()
+            if elapsed == 0:
+                return False
+            # rtl_power timestamps are local time. A daylight-saving or manual
+            # clock rollback starts a new timestamp epoch rather than stale data.
+            if elapsed < -300 or elapsed > self.cfg.data_timeout_seconds:
+                model = self.hop_models.get(hop_key)
+                if model is not None:
+                    model["state"] = self.STATE_IDLE
+                    model["watch_start"] = None
+                    model["cooldown_start"] = None
+                    model["recent_scores"].clear()
+            elif elapsed < 0:
+                return False
+        self.last_record_timestamp[hop_key] = observed_at
+        return True
 
     def finalize_calibration(self):
         if not self.calibration_samples:
@@ -312,7 +337,7 @@ class AdaptiveBandActivityMonitor:
         }
 
     def step(self, runtime_metrics):
-        now = time.time()
+        now = time.monotonic()
         model = runtime_metrics["hop_model"]
         state = model["state"]
         score = runtime_metrics["score"]
@@ -412,21 +437,43 @@ class AdaptiveBandActivityMonitor:
             ])
 
 
-def parse_rtl_power_record(line: str):
-    """Return (first bin Hz, bin width Hz, power values) from rtl_power CSV."""
-    parts = [p.strip() for p in line.split(",")]
+def parse_rtl_power_csv_record(line: str):
+    """Parse one complete rtl_power row, including its local wall-clock timestamp."""
+    try:
+        parts = next(csv.reader([line], skipinitialspace=True))
+    except (csv.Error, StopIteration):
+        return None
     if len(parts) < 7:
         return None
     try:
+        observed_at = datetime.datetime.strptime(
+            f"{parts[0].strip()} {parts[1].strip()}", "%Y-%m-%d %H:%M:%S")
         first_hz = float(parts[2])
+        high_hz = float(parts[3])
         step_hz = float(parts[4])
-        values = [float(x) for x in parts[6:] if x]
-    except ValueError:
+        samples = int(parts[5])
+        # Empty interior/trailing columns indicate a truncated or malformed row.
+        if any(not value.strip() for value in parts[6:]):
+            return None
+        values = [float(x) for x in parts[6:]]
+    except (ValueError, IndexError):
         return None
-    if (not math.isfinite(first_hz) or not math.isfinite(step_hz) or step_hz <= 0
+    if (not all(math.isfinite(value) for value in (first_hz, high_hz, step_hz))
+            or high_hz <= first_hz or step_hz <= 0 or samples <= 0
             or not values or not all(math.isfinite(value) for value in values)):
         return None
-    return first_hz, step_hz, values
+    # rtl_power's low/high fields describe the first/last reported bin centers.
+    expected_span = step_hz * (len(values) - 1)
+    tolerance = max(2.0, step_hz * 0.02)
+    if abs((high_hz - first_hz) - expected_span) > tolerance:
+        return None
+    return first_hz, step_hz, values, observed_at
+
+
+def parse_rtl_power_record(line: str):
+    """Compatibility helper returning (first bin Hz, bin width Hz, power values)."""
+    record = parse_rtl_power_csv_record(line)
+    return record[:3] if record is not None else None
 
 
 def build_rtl_power_command(cfg: Config, output_csv: str):
@@ -527,7 +574,7 @@ def run_simulation(band_configs):
                     values[i] += 24.0 - abs(i - center) * 1.5
             process_power_sample(monitor, values, first_hz, cfg.bin_size_hz, mode="SIMULATION")
             if monitor.state == monitor.STATE_CALIBRATING:
-                elapsed = time.time() - monitor.calibration_started_at
+                elapsed = time.monotonic() - monitor.calibration_started_at
                 print(f"[SIMULATION {cfg.band_label}] Kalibrierung {min(elapsed, cfg.calibration_seconds):.0f}/{cfg.calibration_seconds}s", flush=True)
     finally:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
@@ -554,18 +601,21 @@ def run_band_scan(cfg, monitor, rtl_power, env):
             while True:
                 line = stream.readline()
                 if line:
-                    record = parse_rtl_power_record(line)
+                    record = parse_rtl_power_csv_record(line)
                     if record is None:
                         continue
+                    first_hz, step_hz, power_values, observed_at = record
+                    hop_key = monitor._hop_key(first_hz, step_hz, len(power_values))
+                    if not monitor.accept_record_timestamp(hop_key, observed_at):
+                        continue
                     last_data_at = time.monotonic()
-                    first_hz, step_hz, power_values = record
                     was_calibrating = monitor.state == monitor.STATE_CALIBRATING
                     process_power_sample(monitor, power_values, first_hz, step_hz)
                     if was_calibrating and monitor.state == monitor.STATE_CALIBRATING:
-                        elapsed = time.time() - monitor.calibration_started_at
-                        if time.time() - last_calibration_print >= 1:
+                        elapsed = time.monotonic() - monitor.calibration_started_at
+                        if time.monotonic() - last_calibration_print >= 1:
                             print(f"[{time.strftime('%H:%M:%S')}] Kalibrierung [{cfg.band_label} MHz] {min(elapsed, cfg.calibration_seconds):.0f}/{cfg.calibration_seconds}s", flush=True)
-                            last_calibration_print = time.time()
+                            last_calibration_print = time.monotonic()
                     continue
                 if proc.poll() is not None:
                     stderr_log.flush()

@@ -1,6 +1,7 @@
 import csv
 import os
 import pty
+import random
 import select
 import subprocess
 import sys
@@ -59,6 +60,40 @@ class BlueEyeTests(unittest.TestCase):
         self.assertIsNone(blueeye.parse_rtl_power_record(line.replace(",10000,1,", ",nan,1,")))
         self.assertIsNone(blueeye.parse_rtl_power_record(line.replace(",-100.0,", ",inf,")))
 
+    def test_rtl_power_parser_rejects_partial_rows_and_bad_metadata(self):
+        valid = "2026-11-19,12:00:00,380000000,380020000,10000,2,-95,-94,-96"
+        parsed = blueeye.parse_rtl_power_csv_record(valid)
+        self.assertEqual(parsed[:3], (380000000.0, 10000.0, [-95.0, -94.0, -96.0]))
+        self.assertEqual(parsed[3].strftime("%Y-%m-%d %H:%M:%S"), "2026-11-19 12:00:00")
+        self.assertIsNone(blueeye.parse_rtl_power_csv_record(valid[:-3]))
+        self.assertIsNone(blueeye.parse_rtl_power_csv_record(valid.replace(",-94,", ",,")))
+        self.assertIsNone(blueeye.parse_rtl_power_csv_record(valid.replace(",2,", ",0,")))
+        self.assertIsNone(blueeye.parse_rtl_power_csv_record(valid.replace("12:00:00", "not-a-time")))
+        self.assertIsNone(blueeye.parse_rtl_power_csv_record(
+            "2026-11-19,12:00:00,380000000,380030000,10000,2,-95,-94,-96"))
+
+    def test_duplicate_late_and_large_gap_hop_records_are_handled_by_measurement_time(self):
+        monitor, key = self.calibrated_monitor()
+        base = blueeye.datetime.datetime(2026, 11, 19, 12, 0, 0)
+        self.assertTrue(monitor.accept_record_timestamp(key, base))
+        self.assertFalse(monitor.accept_record_timestamp(key, base))
+        self.assertFalse(monitor.accept_record_timestamp(key, base - blueeye.datetime.timedelta(seconds=1)))
+        model = monitor.hop_models[key]
+        model["state"] = monitor.STATE_WATCH
+        model["watch_start"] = time.monotonic() - 10
+        model["recent_scores"].append(80.0)
+        self.assertTrue(monitor.accept_record_timestamp(
+            key, base + blueeye.datetime.timedelta(seconds=monitor.cfg.data_timeout_seconds + 1)))
+        self.assertEqual(model["state"], monitor.STATE_IDLE)
+        self.assertIsNone(model["watch_start"])
+        self.assertEqual(len(model["recent_scores"]), 0)
+        model["state"] = monitor.STATE_ALERT
+        model["recent_scores"].append(80.0)
+        self.assertTrue(monitor.accept_record_timestamp(
+            key, base - blueeye.datetime.timedelta(hours=1)))
+        self.assertEqual(model["state"], monitor.STATE_IDLE)
+        self.assertEqual(len(model["recent_scores"]), 0)
+
     def test_hop_models_do_not_mix_baselines_or_state(self):
         monitor = blueeye.AdaptiveBandActivityMonitor(self.config())
         a = monitor._hop_key(380000000, 10000, 257)
@@ -98,7 +133,7 @@ class BlueEyeTests(unittest.TestCase):
         observed_states = []
         last_metrics = None
         for index in range(32):
-            with mock.patch.object(blueeye.time, "time", return_value=1000.0 + index):
+            with mock.patch.object(blueeye.time, "monotonic", return_value=1000.0 + index):
                 raw = monitor.parse_metrics_from_power_values(self.row(-87, 500, .2))
                 last_metrics = monitor.compute_runtime_metrics(raw, key)
                 _, _, state = monitor.step(last_metrics)
@@ -117,7 +152,7 @@ class BlueEyeTests(unittest.TestCase):
         states = []
         last_metrics = None
         for index in range(8):
-            with mock.patch.object(blueeye.time, "time", return_value=2000.0 + index):
+            with mock.patch.object(blueeye.time, "monotonic", return_value=2000.0 + index):
                 last_metrics = monitor.compute_runtime_metrics(monitor.parse_metrics_from_power_values(active), key)
                 _, _, state = monitor.step(last_metrics)
                 states.append(state)
@@ -148,7 +183,7 @@ class BlueEyeTests(unittest.TestCase):
         monitor.hop_models[key] = model
         self.assertEqual(model["alert_on"], 50.0)
         for index in range(8):
-            with mock.patch.object(blueeye.time, "time", return_value=5000.0 + index):
+            with mock.patch.object(blueeye.time, "monotonic", return_value=5000.0 + index):
                 metrics = monitor.compute_runtime_metrics(
                     monitor.parse_metrics_from_power_values(self.row(count=500, jitter=.2)), key)
                 _, _, state = monitor.step(metrics)
@@ -163,7 +198,7 @@ class BlueEyeTests(unittest.TestCase):
         signal_row[245:250] = [value + 28 for value in signal_row[245:250]]
         states = []
         for tick in (100.0, 101.0, 102.1):
-            with mock.patch.object(blueeye.time, "time", return_value=tick):
+            with mock.patch.object(blueeye.time, "monotonic", return_value=tick):
                 metrics = monitor.compute_runtime_metrics(monitor.parse_metrics_from_power_values(signal_row), key)
                 triggered, _, state = monitor.step(metrics)
                 states.append((state, triggered))
@@ -193,6 +228,23 @@ class BlueEyeTests(unittest.TestCase):
         self.assertEqual(len(adaptation_rows[0]), len(adaptation_rows[1]))
         self.assertIn("380–385 hop", main_rows[1][1])
         self.assertEqual(adaptation_rows[1][1], "380–385")
+
+    def test_long_run_keeps_model_windows_bounded_and_logs_every_measurement(self):
+        monitor, key = self.calibrated_monitor()
+        rng = random.Random(917)
+        for _ in range(300):
+            values = [-95.0 + rng.gauss(0, 0.8) for _ in range(500)]
+            metrics = monitor.compute_runtime_metrics(monitor.parse_metrics_from_power_values(values), key)
+            _, score, state = monitor.step(metrics)
+            monitor.log(metrics, score, state)
+        model = monitor.hop_models[key]
+        self.assertLessEqual(len(model["baseline_window"]), monitor.cfg.baseline_window_size)
+        self.assertLessEqual(len(model["spread_window"]), monitor.cfg.noise_window_size)
+        self.assertEqual(len(model["background_scores"]), monitor.cfg.threshold_window_size)
+        self.assertLessEqual(len(model["recent_scores"]), 8)
+        for path in (monitor.cfg.log_file, monitor.cfg.adaptation_log_file):
+            with open(path, newline="") as f:
+                self.assertEqual(sum(1 for _ in csv.DictReader(f)), 300)
 
     def test_old_adaptation_schema_is_preserved_and_new_log_is_versioned(self):
         old_path = self.temp_path / "adaptive.csv"
@@ -305,6 +357,29 @@ class BlueEyeTests(unittest.TestCase):
         child_pid = int(pid_marker.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
+
+    def test_live_file_reader_ignores_duplicate_and_late_rtl_power_rows(self):
+        row = lambda second: (
+            f"2026-11-19,12:00:{second:02d},380000000,380020000,10000,2,-95,-95,-95")
+        rows = [row(0), row(1), row(2), row(2), row(1), row(3)]
+        script_rows = repr(rows)
+        tool = self._fake_rtl_power(
+            "import sys\n"
+            f"rows = {script_rows}\n"
+            "with open(sys.argv[-1], 'a') as output:\n"
+            "    for row in rows:\n"
+            "        output.write(row + '\\n')\n"
+            "        output.flush()\n")
+        cfg = self.config(data_timeout_seconds=2)
+        monitor = blueeye.AdaptiveBandActivityMonitor(cfg)
+        with mock.patch.object(monitor, "calibration_finished", side_effect=[False, False, True]):
+            with self.assertRaisesRegex(RuntimeError, "unerwartet mit Status 0"):
+                blueeye.run_band_scan(cfg, monitor, tool, os.environ.copy())
+        with open(cfg.log_file, newline="") as f:
+            rows_written = list(csv.DictReader(f))
+        self.assertEqual(len(rows_written), 1)
+        self.assertEqual(monitor.last_record_timestamp[
+            monitor._hop_key(380000000, 10000, 3)].strftime("%S"), "03")
 
     def test_spawn_setup_failures_remove_temp_csv(self):
         cfg = self.config()
